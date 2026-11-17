@@ -1,0 +1,22 @@
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# MLflow
+mlflow.db
+mlflow.db-journal
+mlruns/
+
+# DVC cache and temporary files
+.dvc/cache/
+.dvc/tmp/
+
+# Secrets
+.env
+
+# IDE
+.idea/
+.vscode/

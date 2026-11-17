@@ -1,3 +1,5 @@
+
+import os
 from pathlib import Path
 import sqlite3
 import numpy as np
@@ -6,6 +8,7 @@ import streamlit as st
 import plotly.express as px
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from mlflow.tracking import MlflowClient
 
 BASE = Path(__file__).resolve().parent
 RAW = BASE / "data/raw/customer_data.csv"
@@ -70,6 +73,105 @@ def theme(fig, height=330):
     return fig
 
 
+def get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def get_mlflow_client():
+    """
+    Streamlit Cloud: connect to DagsHub using Streamlit Secrets.
+    Local computer: use the existing mlflow.db as a fallback.
+    """
+
+    tracking_uri = get_secret("MLFLOW_TRACKING_URI", "")
+    username = get_secret("MLFLOW_TRACKING_USERNAME", "")
+    password = get_secret("MLFLOW_TRACKING_PASSWORD", "")
+
+    if tracking_uri:
+        os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+
+        if username:
+            os.environ["MLFLOW_TRACKING_USERNAME"] = username
+
+        if password:
+            os.environ["MLFLOW_TRACKING_PASSWORD"] = password
+
+        client = MlflowClient(tracking_uri=tracking_uri)
+        return client, "DagsHub"
+
+    if DB.exists():
+        local_uri = "sqlite:///" + DB.as_posix()
+        client = MlflowClient(tracking_uri=local_uri)
+        return client, "Local MLflow database"
+
+    return None, None
+
+
+def get_mlflow_runs():
+    client, connection_name = get_mlflow_client()
+
+    if client is None:
+        return None, None, "No MLflow connection is configured."
+
+    experiments = client.search_experiments()
+
+    if not experiments:
+        return pd.DataFrame(), connection_name, None
+
+    experiment_names = {
+        exp.experiment_id: exp.name
+        for exp in experiments
+    }
+
+    experiment_ids = list(experiment_names.keys())
+
+    runs = client.search_runs(
+        experiment_ids=experiment_ids,
+        order_by=["attributes.start_time DESC"],
+        max_results=10
+    )
+
+    rows = []
+
+    for run in runs:
+        start_time = run.info.start_time
+
+        if start_time:
+            started = pd.to_datetime(
+                start_time,
+                unit="ms"
+            ).strftime("%d-%m-%Y %I:%M %p")
+        else:
+            started = "N/A"
+
+        run_name = run.data.tags.get(
+            "mlflow.runName",
+            "Unnamed run"
+        )
+
+        metrics_text = ", ".join(
+            f"{name}: {value:.4f}"
+            for name, value in run.data.metrics.items()
+        )
+
+        rows.append({
+            "Run name": run_name,
+            "Experiment": experiment_names.get(
+                run.info.experiment_id,
+                "Unknown"
+            ),
+            "Status": run.info.status,
+            "Started": started,
+            "Run ID": run.info.run_id,
+            "Metrics": metrics_text if metrics_text else "No metrics"
+        })
+
+    return pd.DataFrame(rows), connection_name, None
+
+
 @st.cache_data
 def read_data():
     raw = pd.read_csv(RAW) if RAW.exists() else pd.DataFrame()
@@ -87,7 +189,6 @@ def read_data():
 
 raw, df = read_data()
 
-# Calculate saved-project metrics only when saved results are available.
 if not df.empty and all(c in df.columns for c in FEATURES + ["Cluster"]):
     counts = df["Cluster"].value_counts().sort_index()
     profiles = df.groupby("Cluster")[FEATURES].mean().round(1)
@@ -396,38 +497,31 @@ elif page == "Upload Customer Data":
             ]
 
             if missing_columns:
-
                 st.error(
                     "Missing required columns: "
                     + ", ".join(missing_columns)
                 )
 
             elif len(uploaded_df) < 3:
-
                 st.error(
                     "Please upload a dataset containing at least 3 customers."
                 )
 
             else:
 
-                # Convert required feature columns to numeric values.
                 for col in FEATURES:
                     uploaded_df[col] = pd.to_numeric(
                         uploaded_df[col],
                         errors="coerce"
                     )
 
-                # Check for missing or invalid values.
                 if uploaded_df[FEATURES].isna().any().any():
-
                     st.error(
                         "Your required columns contain missing or "
                         "non-numeric values. Please clean your CSV and upload again."
                     )
 
-                # Check for infinite values.
                 elif np.isinf(uploaded_df[FEATURES].to_numpy()).any():
-
                     st.error(
                         "Your data contains infinite values. "
                         "Please correct them and upload again."
@@ -465,7 +559,6 @@ elif page == "Upload Customer Data":
                             )
 
                             if result_df["Cluster"].nunique() < 2:
-
                                 st.error(
                                     "K-Means could not create separate groups. "
                                     "Try different data or another K value."
@@ -478,7 +571,6 @@ elif page == "Upload Customer Data":
                                     result_df["Cluster"]
                                 )
 
-                                # Save results in session state.
                                 st.session_state["upload_result"] = result_df
                                 st.session_state["upload_score"] = result_score
                                 st.session_state["upload_filename"] = uploaded_file.name
@@ -487,7 +579,6 @@ elif page == "Upload Customer Data":
                         except Exception as e:
                             st.error(f"Segmentation failed: {e}")
 
-                    # Display previously generated results.
                     if (
                         "upload_result" in st.session_state
                         and st.session_state.get("upload_filename") == uploaded_file.name
@@ -770,87 +861,78 @@ elif page == "MLOps Tracking":
             unsafe_allow_html=True
         )
 
+    st.subheader("Project files")
+
     items = {
         "Raw dataset": RAW,
         "Segment results": SEG,
         "Saved model": MODEL,
-        "MLflow database": DB,
         "DVC pipeline": BASE / "dvc.yaml",
         "DVC lock": BASE / "dvc.lock"
     }
 
-    st.subheader("Project files")
+    file_status = [
+        {
+            "File": name,
+            "Status": "Available" if path.exists() else "Not found"
+        }
+        for name, path in items.items()
+    ]
+
+    if get_secret("MLFLOW_TRACKING_URI", ""):
+        file_status.append({
+            "File": "MLflow tracking",
+            "Status": "Connected to DagsHub"
+        })
+    else:
+        file_status.append({
+            "File": "Local MLflow database",
+            "Status": "Available" if DB.exists() else "Not found"
+        })
 
     st.dataframe(
-        pd.DataFrame([
-            {
-                "File": k,
-                "Status": "Available" if p.exists() else "Not found"
-            }
-            for k, p in items.items()
-        ]),
+        pd.DataFrame(file_status),
         use_container_width=True,
         hide_index=True
     )
 
     st.subheader("Recent MLflow runs")
 
-    if DB.exists():
+    try:
+        runs_df, connection_name, error = get_mlflow_runs()
 
-        try:
-            con = sqlite3.connect(
-                f"file:{DB.as_posix()}?mode=ro",
-                uri=True
+        if error:
+            st.warning(error)
+            st.info(
+                "Add your DagsHub connection details under "
+                "Streamlit Cloud Settings → Secrets."
             )
 
-            tables = pd.read_sql_query(
-                "SELECT name FROM sqlite_master WHERE type='table'",
-                con
-            ).name.tolist()
+        else:
+            st.success(f"Connected to {connection_name}")
 
-            if "runs" in tables and "experiments" in tables:
-
-                runs = pd.read_sql_query(
-                    """
-                    SELECT
-                        r.run_uuid AS run_id,
-                        r.status,
-                        r.start_time,
-                        e.name AS experiment
-                    FROM runs r
-                    LEFT JOIN experiments e
-                    ON r.experiment_id=e.experiment_id
-                    ORDER BY r.start_time DESC
-                    LIMIT 10
-                    """,
-                    con
-                )
+            if runs_df.empty:
+                st.info("No MLflow runs were found in this experiment.")
+            else:
+                st.caption(f"Showing the latest {len(runs_df)} MLflow runs.")
 
                 st.dataframe(
-                    runs,
+                    runs_df,
                     use_container_width=True,
                     hide_index=True
                 )
 
-            else:
-                st.info(
-                    "Database found. Open MLflow UI to see all experiment details."
+                st.download_button(
+                    "Download MLflow run history",
+                    runs_df.to_csv(index=False).encode("utf-8"),
+                    "mlflow_runs.csv",
+                    "text/csv"
                 )
 
-            con.close()
-
-        except Exception:
-            st.info(
-                "MLflow database found. Run "
-                "`mlflow ui --backend-store-uri sqlite:///mlflow.db` "
-                "in the project terminal to open MLflow."
-            )
-
-    else:
-
-        st.warning(
-            "MLflow database not found. Run the training script "
-            "to create experiment records."
+    except Exception as e:
+        st.error(f"Unable to connect to MLflow: {e}")
+        st.caption(
+            "Check your DagsHub URL and credentials in Streamlit Secrets."
         )
 
     st.caption(
